@@ -22,7 +22,7 @@ gruppiert sie in Absaetze mit Zeitstempel `[HH:MM:SS]` und teilt sie in Chunks
 
    Optionen: `--out DIR`, `--chunk-minutes 20`, `--plain` (ohne Zeitstempel),
    `--list` (nur verfuegbare Spuren zeigen), `--cookies cookies.txt` (Altersfreigabe/Bot-Pruefung),
-   `--backend auto|ytdlp|supadata` (siehe Backends).
+   `--backend auto|ytdlp|supadata` (siehe Backends), `--fix`/`--no-fix` (Korrekturliste), `--from-text` (siehe Fallback-Reihenfolge).
 
 2. **Zusammenfassung lesen.** Das Skript druckt nur Metadaten, die gewaehlte Spur
    (manuell oder automatisch), Woerter, geschaetzte Tokens und eine Chunk-Tabelle
@@ -43,7 +43,48 @@ gruppiert sie in Absaetze mit Zeitstempel `[HH:MM:SS]` und teilt sie in Chunks
    z. B. `[01:05:56](https://youtu.be/ABC123def45?t=3956)`.
    Woertliche Zitate kurz halten; sonst sinngemaess zusammenfassen.
    Kennzeichnen, wenn die Spur **automatisch** erzeugt wurde: Eigennamen, Fachbegriffe
-   und Zahlen koennen falsch transkribiert sein.
+   und Zahlen koennen falsch transkribiert sein (siehe Korrekturen).
+
+## Fallback-Reihenfolge
+
+1. **Skript** mit `--backend auto` (Standard).
+2. Scheitert es an der Bot-Pruefung (Exit 3) und ist **kein** `SUPADATA_API_KEY` gesetzt:
+   **Browser-Pfad, nur wenn ein Browser-Tool verfuegbar ist** (Claude in Chrome / eingebauter Browser).
+3. Sonst den Nutzer bitten, das Transkript einzufuegen (YouTube: "..." > "Transkript anzeigen",
+   Text markieren und kopieren), in eine Datei bzw. per stdin an `--from-text -` geben.
+
+### Import-Modus `--from-text FILE|-`
+
+```bash
+python3 .../yt_transcript.py "<URL>" --from-text stage1.txt --title "..." --channel "..." --duration 1:42:10
+python3 .../yt_transcript.py "<URL>" --from-text stage2.txt --append   # weiterer Abschnitt, Ueberlappung wird entdoppelt
+```
+
+Kein Netzwerkzugriff. Erkennt `0:00` + Textzeile, `0:00 Text`, `1:02:33`, Barrierefreiheits-Zeilen
+("2 Minuten, 5 Sekunden"), Kapitelueberschriften und UI-Rauschen ("Transkript", "Kapitel" ...).
+"Deutsch (automatisch erzeugt)" setzt Spur auto/de; sonst `--track-kind auto|manual`, `--track-lang`.
+Rohtext liegt in `yt-transcripts/<ID>/raw_panel.txt`. Kapitel aus dem Panel steuern das Chunking.
+Ohne `--duration` ist die Dauer nur geschaetzt; mit ihr zeigt die Zusammenfassung die Abdeckung in %.
+
+### Browser-Pfad (strikte Regeln)
+
+- Video oeffnen, "...mehr" > "Transkript anzeigen" mit **normalen Klicks**.
+- Panel-Text mit dem Seitentext-Tool lesen. Der Seitentext wird bei ca. 50.000 Zeichen abgeschnitten:
+  **in Etappen** lesen (Panel scrollen), jede Etappe in eine Datei speichern, dann
+  `--from-text stage1.txt` und fuer jede weitere Etappe `--from-text stageN.txt --append`.
+- **Abdeckung pruefen:** letzter Zeitstempel ca. gleich Videodauer (`--duration` angeben), sonst weiterlesen.
+- **Niemals JavaScript ausfuehren oder die Seite veraendern ohne ausdrueckliche Zustimmung des Nutzers
+  in dieser Unterhaltung.** Vorher fragen und den Grund erklaeren.
+- Nie Kontoeinstellungen aendern, nie anmelden, nie Captchas/Bot-Pruefungen loesen: stoppen und berichten.
+
+## Korrekturen (ASR-Fehlhoerungen)
+
+`corrections.tsv` (neben `scripts/`): pro Zeile `falsch<TAB>richtig`, `#` = Kommentar, z. B.
+`Datef` -> `DATEV`. Ganze Woerter, Gross-/Kleinschreibung zaehlt (`Datefs` bleibt unveraendert,
+`Clotilde` ebenfalls). Standard: nur bei **automatischen** Spuren; `--fix`/`--no-fix` erzwingen.
+Eigene Eintraege in `~/.config/yt-transcript/corrections.tsv` (gleiches Format, hat Vorrang).
+Nur Schreibweisen aufnehmen, die keine echten deutschen Woerter sind. Zusammenfassung, `meta.json` und
+Kopf von `transcript.md` nennen die Zahl der Ersetzungen; die Rohdaten bleiben ohne `--fix` unveraendert.
 
 ## Backends
 
@@ -67,8 +108,8 @@ Auto-Spuren werden nur im Notfall genutzt. Letzter Fallback ist `youtube-transcr
 | Exit | Bedeutung / Abhilfe |
 |------|---------------------|
 | 2 | URL/ID nicht erkannt: Link pruefen (Playlist-Links brauchen `v=`). |
-| 3 | Metadaten nicht abrufbar (oder `SUPADATA_API_KEY` fehlt/ungueltig): Video privat/geloescht/altersbeschraenkt oder Bot-Pruefung. Einige Minuten warten, ggf. `--cookies cookies.txt` (exportiert aus dem Browser). |
-| 4 | Keine Untertitel vorhanden (z. B. Livestream, deaktiviert). Mit `--list` pruefen; sonst Nutzer bitten, das Transkript einzufuegen (YouTube: "..." > "Transkript anzeigen"). |
+| 3 | Metadaten nicht abrufbar (oder `SUPADATA_API_KEY` fehlt/ungueltig): Video privat/geloescht/altersbeschraenkt oder Bot-Pruefung. Einige Minuten warten, ggf. `--cookies cookies.txt`; sonst Fallback-Reihenfolge (Browser-Pfad bzw. Einfuegen + `--from-text`). |
+| 4 | Keine Untertitel vorhanden (z. B. Livestream, deaktiviert). Mit `--list` pruefen; sonst Nutzer bitten, das Transkript einzufuegen (YouTube: "..." > "Transkript anzeigen") und mit `--from-text -` einlesen. |
 | 5 | Download gescheitert, meist **HTTP 429**. Das Skript wiederholt automatisch nach 5/15/40 s. Danach 2-5 Minuten warten und erneut starten, nicht in Schleife wiederholen. |
 
 - Nur **eine** Untertitelspur pro Aufruf wird geladen; weitere Sprachen erst nach einer Pause anfordern.

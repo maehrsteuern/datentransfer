@@ -34,3 +34,24 @@ blockt. Der Key gehoert nur in die Umgebung (z. B. Netzwerk-Secrets), nie in den
 ```bash
 SUPADATA_API_KEY=... python3 scripts/yt_transcript.py dQw4w9WgXcQ --backend supadata --lang de,en
 ```
+
+## Import-Modus (`--from-text`)
+
+Fuer Faelle, in denen YouTube den Abruf blockt: Text aus dem Panel "Transkript anzeigen" kopieren
+und ohne Netzwerkzugriff einlesen. Mehrere Etappen mit `--append` (Ueberlappung wird entdoppelt;
+Rohtext in `yt-transcripts/<ID>/raw_panel.txt`).
+
+```bash
+python3 scripts/yt_transcript.py "<URL>" --from-text panel.txt --title "Titel" --duration 1:42:10
+pbpaste | python3 scripts/yt_transcript.py "<URL>" --from-text -
+python3 scripts/yt_transcript.py "<URL>" --from-text teil2.txt --append
+```
+
+Weitere Optionen: `--channel`, `--track-kind auto|manual`, `--track-lang de`.
+
+## Korrekturliste
+
+`corrections.tsv` (`falsch<TAB>richtig`, `#` = Kommentar) behebt typische Fehlhoerungen automatischer
+Untertitel (z. B. Datef -> DATEV, Chatgpt -> ChatGPT). Ganze Woerter, Gross-/Kleinschreibung zaehlt;
+Standard nur bei automatischen Spuren (`--fix` / `--no-fix`). Eigene Eintraege in
+`~/.config/yt-transcript/corrections.tsv`. Nur Nicht-Woerter aufnehmen, damit korrekter Text nie veraendert wird.

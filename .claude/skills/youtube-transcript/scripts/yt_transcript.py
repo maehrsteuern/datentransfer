@@ -3,7 +3,16 @@
 
 Aufruf:
     yt_transcript.py URL [--lang de,en] [--out DIR] [--chunk-minutes 20] [--plain] [--list]
-                      [--backend auto|ytdlp|supadata]
+                      [--backend auto|ytdlp|supadata] [--fix|--no-fix]
+    yt_transcript.py URL --from-text FILE|- [--append] [--title T] [--channel C] [--duration H:MM:SS]
+                      [--track-kind auto|manual] [--track-lang de]
+
+Import-Modus (--from-text): liest Text aus dem YouTube-Panel "Transkript anzeigen" (Datei oder
+stdin mit "-"), ohne jeden Netzwerkzugriff. Der Rohtext liegt danach in <out>/<ID>/raw_panel.txt;
+mit --append wird weiterer Panel-Text ergaenzt (Ueberlappung wird per (Zeit, Text) entdoppelt).
+
+Korrekturen (corrections.tsv neben scripts/, plus ~/.config/yt-transcript/corrections.tsv):
+ganze Woerter, Gross-/Kleinschreibung beachtet. Standard: nur bei automatischen Spuren.
 
 Ausgabe (Standard: ./yt-transcripts/<VIDEO_ID>/):
     transcript.md   Kopf mit Metadaten + Kapitel + kompletter Text
@@ -231,13 +240,18 @@ def parse_vtt(text):
     return out
 
 
-def clean_segments(segs):
-    """Entfernt Rolling-/Doppel-Fragmente (typisch bei Auto-Untertiteln)."""
+def clean_segments(segs, rolling=True):
+    """Entfernt Rolling-/Doppel-Fragmente (typisch bei Auto-Untertiteln).
+
+    rolling=False (Panel-Import): nur Muell entfernen, Text nie verschmelzen/kuerzen."""
     out = []  # [start, text]
     for start, text in segs:
         text = text.replace("​", "").strip()
         text = re.sub(r"\[(?:Music|Musik|Applause|Applaus)\]", "", text, flags=re.I).strip()
         if not text:
+            continue
+        if not rolling:
+            out.append([start, text])
             continue
         if not out:
             out.append([start, text])
@@ -427,6 +441,177 @@ def sd_info(vid, key):
             "transcript_languages": d.get("transcriptLanguages") or []}
 
 
+# ------------------------------------------------------------------ panel import
+PANEL_SEP = "-----"
+_UNIT = r"(?:Stunden?|Std\.?|Minuten?|Min\.?|Sekunden?|Sek\.?|hours?|hrs?|minutes?|mins?|seconds?|secs?)"
+_ACC = re.compile(rf"^\d+\s*{_UNIT}(?:[\s,]+(?:und\s+|and\s+)?\d+\s*{_UNIT})*$", re.I)
+_TS_ONLY = re.compile(r"^((?:\d{1,2}:)?\d{1,2}:\d{2})$")
+_TS_TEXT = re.compile(r"^((?:\d{1,2}:)?\d{1,2}:\d{2})\s+(\S.*)$")
+_AUTO_LANG = re.compile(
+    r"^(\S[^()]*?)\s*\((?:automatisch(?: erzeugt)?|auto-generated|automatically generated)\)$", re.I)
+_LANGS = {"deutsch": "de", "englisch": "en", "english": "en", "german": "de",
+          "franzoesisch": "fr", "französisch": "fr", "french": "fr", "spanisch": "es",
+          "spanish": "es", "italienisch": "it", "italian": "it"}
+_NOISE = {"transkript", "transkript anzeigen", "transkript ausblenden", "kapitel", "untertitel",
+          "im video suchen", "transcript", "show transcript", "chapters", "search in video",
+          "...mehr", "mehr", "weniger anzeigen", "nach kapiteln"}
+
+
+def _secs(ts):
+    p = [int(x) for x in ts.split(":")]
+    return p[0] * 3600 + p[1] * 60 + p[2] if len(p) == 3 else p[0] * 60 + p[1]
+
+
+def _acc_secs(line):
+    total = 0
+    for n, unit in re.findall(r"(\d+)\s*([A-Za-z]+)", line):
+        u = unit.lower()
+        total += int(n) * (3600 if u.startswith(("stunde", "std", "h")) else 60 if u.startswith("m") else 1)
+    return total
+
+
+def parse_duration(s):
+    """'1:23:45', '83:20' oder Sekunden -> int Sekunden (None bei Unsinn)."""
+    s = (s or "").strip()
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    return _secs(s) if _TS_ONLY.match(s) else None
+
+
+def _header_like(line):
+    return (len(line) <= 80 and len(line.split()) <= 12 and not line[-1] in ".!?…,;:"
+            and not line[0].islower())
+
+
+def parse_panel(text):
+    """Text des Panels 'Transkript anzeigen' -> dict(segs, chapters, lang, auto, dupes).
+
+    segs: [(sekunden, text)] sortiert, entdoppelt nach (Zeit, Text)."""
+    toks, lang, auto, seen_ts = [], None, False, False
+    for raw in text.replace("\r", "").replace("​", "").split("\n"):
+        ln = re.sub(r"\s+", " ", raw).strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if re.fullmatch(r"-{5,}", ln):
+            toks.append(("sep",))
+            continue
+        if low in _NOISE:
+            continue
+        m = _AUTO_LANG.match(ln)
+        if m:
+            auto = True
+            lang = _LANGS.get(m.group(1).strip().lower()) or lang
+            continue
+        if not seen_ts and low in _LANGS:
+            lang = _LANGS[low]
+            continue
+        m = _TS_ONLY.match(ln) or _TS_TEXT.match(ln)
+        if m:
+            seen_ts = True
+            toks.append(("ts", _secs(m.group(1)), m.group(2) if m.lastindex == 2 else ""))
+        elif _ACC.match(ln):
+            toks.append(("acc", _acc_secs(ln), ln))
+        else:
+            toks.append(("text", ln))
+    # Barrierefreiheits-Zeilen: mit numerischen Zeitstempeln ueberfluessig (neben einem ts -> weg,
+    # sonst normaler Text); ohne numerische Zeitstempel dienen sie selbst als Zeitstempel.
+    has_num = any(t[0] == "ts" for t in toks)
+    fixed = []
+    for i, t in enumerate(toks):
+        if t[0] != "acc":
+            fixed.append(t)
+        elif not has_num:
+            fixed.append(("ts", t[1], ""))
+        elif not ((i > 0 and toks[i - 1][0] == "ts") or (i + 1 < len(toks) and toks[i + 1][0] == "ts")):
+            fixed.append(("text", t[2]))
+    toks = fixed
+
+    entries, chapters, cur, pend = [], [], None, None
+    for i, t in enumerate(toks):
+        if t[0] == "sep":
+            cur, pend = None, None
+        elif t[0] == "ts":
+            cur = [t[1], t[2]]
+            entries.append(cur)
+            if pend:
+                chapters.append((t[1], pend))
+                pend = None
+        elif cur is None:  # Text vor dem ersten Zeitstempel: Kapitelkopf oder Rauschen
+            if _header_like(t[1]):
+                pend = t[1]
+        elif not cur[1]:
+            cur[1] = t[1]
+        elif _header_like(t[1]) and i + 1 < len(toks) and toks[i + 1][0] == "ts":
+            pend = t[1]  # Kapitelueberschrift zwischen zwei Eintraegen
+        else:
+            cur[1] += " " + t[1]
+
+    seen, segs, dupes = set(), [], 0
+    for ts, tx in entries:
+        if not tx:
+            continue
+        if (ts, tx) in seen:
+            dupes += 1
+            continue
+        seen.add((ts, tx))
+        segs.append((float(ts), tx))
+    segs.sort(key=lambda s: s[0])
+    chs = {}
+    for ts, title in chapters:
+        chs.setdefault(ts, title)
+    chs = sorted(chs.items())
+    if len(chs) < 2:
+        chs = []
+    elif chs[0][0] > 0:
+        chs.insert(0, (0, "Anfang"))
+    chapters = [{"start_time": s, "title": ti} for s, ti in chs]
+    for c, n in zip(chapters, chapters[1:]):
+        c["end_time"] = n["start_time"]
+    return {"segs": segs, "chapters": chapters, "lang": lang, "auto": auto, "dupes": dupes}
+
+
+# ------------------------------------------------------------------ corrections
+def load_corrections():
+    """corrections.tsv (Skill-Ordner) + ~/.config/yt-transcript/corrections.tsv (ueberschreibt) -> (dict, [Pfade])."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    table, files = {}, []
+    for p in (os.path.join(root, "corrections.tsv"),
+              os.path.expanduser("~/.config/yt-transcript/corrections.tsv")):
+        if not os.path.isfile(p):
+            continue
+        files.append(p)
+        with open(p, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.rstrip("\r\n")
+                if not ln.strip() or ln.lstrip().startswith("#"):
+                    continue
+                parts = ln.split("\t")
+                if len(parts) < 2:
+                    continue
+                k, v = " ".join(parts[0].split()), parts[1].strip()
+                if k and v and k != v:
+                    table[k] = v
+    return table, files
+
+
+def apply_corrections(segs, table):
+    """Ganze Woerter, Gross-/Kleinschreibung beachtet. -> (segs, {(falsch, richtig): anzahl})."""
+    counts = {}
+    if not table:
+        return segs, counts
+    keys = sorted(table, key=len, reverse=True)
+    pat = re.compile(r"(?<!\w)(?:" + "|".join(r"\s+".join(re.escape(w) for w in k.split()) for k in keys)
+                     + r")(?!\w)")
+
+    def sub(m):
+        k = " ".join(m.group(0).split())
+        counts[(k, table[k])] = counts.get((k, table[k]), 0) + 1
+        return table[k]
+
+    return [[s, pat.sub(sub, t)] for s, t in segs], counts
+
+
 # --------------------------------------------------------------------- chunking
 def make_ranges(chapters, duration, chunk_min):
     """Liefert [(start, end, titel)] gemaess Kapiteln oder festen Fenstern."""
@@ -476,7 +661,23 @@ def main():
     ap.add_argument("--list", action="store_true", help="Nur verfuegbare Untertitelspuren anzeigen")
     ap.add_argument("--backend", choices=("auto", "ytdlp", "supadata"), default="auto",
                     help="Quelle: auto (Supadata, wenn SUPADATA_API_KEY gesetzt, sonst yt-dlp), ytdlp, supadata")
+    ap.add_argument("--from-text", metavar="FILE",
+                    help="Import-Modus: Text aus dem Panel 'Transkript anzeigen' (Datei oder '-' fuer stdin), ohne Netzwerk")
+    ap.add_argument("--append", action="store_true",
+                    help="Mit --from-text: Text an vorhandenes raw_panel.txt anhaengen (mehrstufiges Einlesen)")
+    ap.add_argument("--title", help="Titel (nur --from-text)")
+    ap.add_argument("--channel", help="Kanal (nur --from-text)")
+    ap.add_argument("--duration", help="Videodauer H:MM:SS, MM:SS oder Sekunden (nur --from-text)")
+    ap.add_argument("--track-kind", choices=("auto", "manual"),
+                    help="Spurart im Import-Modus (Standard: auto, bzw. aus dem Panel-Kopf erkannt)")
+    ap.add_argument("--track-lang", help="Sprache im Import-Modus (Standard: de, bzw. aus dem Panel-Kopf)")
+    ap.add_argument("--fix", action="store_true", help="corrections.tsv immer anwenden (Standard: nur bei automatischen Spuren)")
+    ap.add_argument("--no-fix", action="store_true", help="corrections.tsv nie anwenden")
     a = ap.parse_args()
+    if a.fix and a.no_fix:
+        die(2, "--fix und --no-fix schliessen sich aus.")
+    if a.append and not a.from_text:
+        die(2, "--append gibt es nur zusammen mit --from-text.")
 
     vid = parse_video_id(a.url)
     if not vid:
@@ -485,13 +686,48 @@ def main():
 
     key_env = os.environ.get("SUPADATA_API_KEY", "").strip()
     backend = a.backend
-    if backend == "auto":
+    if a.from_text:
+        backend = "text"
+    elif backend == "auto":
         backend = "supadata" if key_env else "ytdlp"
     if backend == "supadata" and not key_env:
         die(3, "SUPADATA_API_KEY ist nicht gesetzt. Key als Umgebungsvariable (Netzwerk-Secret) "
                "in den Umgebungseinstellungen hinterlegen - nie im Chat einfuegen.")
 
-    if backend == "supadata":
+    if backend == "text":
+        try:
+            if a.from_text == "-":
+                raw_new = sys.stdin.read()
+            else:
+                with open(a.from_text, encoding="utf-8", errors="replace") as f:
+                    raw_new = f.read()
+        except OSError as e:
+            die(2, f"Textdatei nicht lesbar: {e}")
+        base = os.path.join(a.out, vid)
+        os.makedirs(base, exist_ok=True)
+        raw_path = os.path.join(base, "raw_panel.txt")
+        raw = raw_new
+        if os.path.isfile(raw_path):
+            if a.append:
+                with open(raw_path, encoding="utf-8") as f:
+                    raw = f.read().rstrip("\n") + f"\n{PANEL_SEP}\n" + raw_new
+            else:
+                print("Hinweis: vorhandenes raw_panel.txt wird ersetzt (--append zum Ergaenzen).", file=sys.stderr)
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(raw.rstrip("\n") + "\n")
+        panel = parse_panel(raw)
+        segs, chapters = panel["segs"], panel["chapters"]
+        if not segs:
+            die(4, "Im Text wurden keine Zeitstempel-Eintraege erkannt (Format z. B. '0:00' + Text-Zeile).")
+        track_kind = a.track_kind or "auto"
+        key = (a.track_lang or panel["lang"] or "de").lower()
+        is_auto, fmt, source = track_kind == "auto", "text", "Browser-Import (Transkript-Panel)"
+        duration = parse_duration(a.duration) if a.duration else 0
+        if a.duration and duration is None:
+            die(2, "--duration nicht lesbar (erwartet H:MM:SS, MM:SS oder Sekunden).")
+        info = {"title": a.title or "unbekannt", "channel": a.channel or "unbekannt",
+                "upload_date": "unbekannt", "language": key, "description": ""}
+    elif backend == "supadata":
         try:
             info = sd_info(vid, key_env)
         except SupadataError as e:
@@ -519,7 +755,7 @@ def main():
             if "not a bot" in low:
                 hint = (" (YouTube-Bot-Pruefung/IP-Drosselung: einige Minuten warten, evtl. --cookies cookies.txt angeben."
                         " Alternative: SUPADATA_API_KEY in den Umgebungseinstellungen (Netzwerk-Secrets/Umgebungsvariable) "
-                        "setzen, dann nutzt --backend auto die Supadata-API)")
+                        "setzen, dann nutzt --backend auto die Supadata-API. Oder Transkript-Panel-Text per --from-text einlesen)")
             elif "age" in low or "sign in" in low:
                 hint = " (Altersbeschraenkt/Anmeldung noetig: --cookies cookies.txt angeben oder Transkript manuell einfuegen)"
             elif "429" in msg:
@@ -556,12 +792,23 @@ def main():
                 die(5, "Untertitel-Download fehlgeschlagen (vermutlich HTTP 429 / IP-Sperre). "
                        "Spaeter erneut versuchen oder anderes Netz nutzen.")
             die(4, "Keine Untertitel fuer dieses Video verfuegbar. "
-                   "Bitte Transkript manuell einfuegen (YouTube: '...' > 'Transkript anzeigen').")
+                   "Transkript-Panel-Text per --from-text einlesen (YouTube: '...' > 'Transkript anzeigen').")
 
-    clean = clean_segments(segs)
+    clean = clean_segments(segs, rolling=backend != "text")
+    apply_fix = True if a.fix else False if a.no_fix else bool(is_auto)
+    corr = {"applied": apply_fix, "count": 0, "top": [], "files": []}
+    if apply_fix:
+        table, corr["files"] = load_corrections()
+        clean, counts = apply_corrections(clean, table)
+        corr["count"] = sum(counts.values())
+        corr["top"] = [{"from": k, "to": v, "count": n}
+                       for (k, v), n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:5]]
     paras = build_paragraphs(clean)
     if not paras:
         die(4, "Untertitel waren leer.")
+    if backend == "text" and duration and clean[-1][0] > duration:
+        print("Hinweis: --duration ist kleiner als der letzte Zeitstempel und wird ignoriert.", file=sys.stderr)
+        duration = 0
     if not duration:
         duration = int(paras[-1][0]) + PARA_SECONDS
     words_total = sum(len(t.split()) for _, t in paras)
@@ -603,6 +850,8 @@ def main():
              f"- Kanal: {channel}", f"- Hochgeladen: {upload}", f"- Dauer: {hms(duration)}",
              f"- Link: {link}", f"- Untertitelspur: {key} ({kind}, Format {fmt}, Quelle {source})",
              f"- Woerter: {words_total}, geschaetzte Tokens: {est_tokens(words_total)}"]
+    if corr["applied"]:
+        lines.append(f"- Korrekturen: automatisch korrigiert, Liste: corrections.tsv ({corr['count']} Ersetzungen)")
     if desc:
         lines += ["", "## Beschreibung (gekuerzt)", "", desc]
     if chapters:
@@ -617,7 +866,7 @@ def main():
             "language": info.get("language"), "backend": backend, "track": key, "track_kind": kind, "source": source,
             "words": words_total, "est_tokens": est_tokens(words_total),
             "chapters": [{"start": c["start_time"], "title": c.get("title")} for c in chapters],
-            "chunks": chunks}
+            "corrections": corr, "last_timestamp": int(clean[-1][0]), "chunks": chunks}
     with open(os.path.join(base, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -626,6 +875,16 @@ def main():
     print(f"Titel:   {title}\nKanal:   {channel}  ({upload})\nDauer:   {hms(duration)}")
     print(f"Spur:    {key} ({kind}, {source})")
     print(f"Umfang:  {words_total} Woerter, ca. {est_tokens(words_total)} Tokens")
+    if backend == "text":
+        cov = f"letzter Zeitstempel {hms(clean[-1][0])}"
+        if a.duration:
+            cov += f" von {hms(duration)} ({min(100, int(clean[-1][0] * 100 / max(duration, 1)))} %)"
+        print(f"Import:  {len(segs)} Eintraege, {panel['dupes']} Doppelte entfernt, {cov}")
+    if corr["applied"]:
+        top = ", ".join(f"{t['from']}→{t['to']} ×{t['count']}" for t in corr["top"])
+        print(f"Korrekturen: {corr['count']} Ersetzungen" + (f" (Top: {top})" if top else ""))
+    else:
+        print("Korrekturen: aus (manuelle Spur oder --no-fix)")
     print(f"Datei:   {p}/transcript.md\nChunks:  {p}/chunks/ ({len(chunks)} Dateien)\nMeta:    {p}/meta.json")
     print("Nr | Datei | Zeit | Tokens | Kapitel")
     for n, c in enumerate(chunks[:20], 1):
