@@ -1,0 +1,49 @@
+# Korrekturliste fuer Auto-Untertitel (ASR-Fehlhoerungen): falsch<TAB>richtig, eine Zeile pro Eintrag.
+# Ganze Woerter, Gross-/Kleinschreibung zaehlt (Datefs matcht NICHT Datef; Plural/Variante als eigene Zeile eintragen).
+# Mehrwort-Schluessel erlaubt. Nur Zeichenfolgen aufnehmen, die KEINE echten deutschen Woerter sind.
+# Bewusst weggelassen: Kopilot (echtes Wort: Kopilot), Elster (Vogel), Haufe-Varianten (keine sicheren Fehlschreibungen).
+# Eigene Eintraege: ~/.config/yt-transcript/corrections.tsv (gleiches Format, ueberschreibt diese Liste).
+# --- DATEV und Steuer-/Buchhaltungssoftware
+Datef	DATEV
+Datew	DATEV
+Dateff	DATEV
+Datev	DATEV
+DateV	DATEV
+Mein Elster	Mein ELSTER
+Elstam	ELStAM
+Gobd	GoBD
+Xrechnung	XRechnung
+X-Rechnung	XRechnung
+X Rechnung	XRechnung
+Zugferd	ZUGFeRD
+# --- KI-Anbieter und -Produkte
+Enhropic	Anthropic
+Antropic	Anthropic
+Anthropik	Anthropic
+Anthrophic	Anthropic
+Clot	Claude
+Claud	Claude
+Klaten	Klardaten
+Lang Dock	Langdock
+Langdog	Langdock
+Langdoc	Langdock
+Chat GPT	ChatGPT
+Chatgpt	ChatGPT
+ChatGpt	ChatGPT
+Chat-GPT	ChatGPT
+Open AI	OpenAI
+OpenAi	OpenAI
+Openai	OpenAI
+Jemini	Gemini
+Gemeni	Gemini
+Microsoft Kopilot	Microsoft Copilot
+Deep Seek	DeepSeek
+Deepseek	DeepSeek
+Notebook LM	NotebookLM
+Vibe Coding	Vibecoding
+Vibe-Coding	Vibecoding
+# --- MCP
+M C P	MCP
+M-C-P	MCP
+Emcp	MCP
+EMCP	MCP

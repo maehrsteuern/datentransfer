@@ -1,0 +1,5 @@
+
+# YouTube-Transkripte
+yt-transcripts/
+__pycache__/
+*.pyc
