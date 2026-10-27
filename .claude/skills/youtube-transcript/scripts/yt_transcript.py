@@ -3,6 +3,7 @@
 
 Aufruf:
     yt_transcript.py URL [--lang de,en] [--out DIR] [--chunk-minutes 20] [--plain] [--list]
+                      [--backend auto|ytdlp|supadata]
 
 Ausgabe (Standard: ./yt-transcripts/<VIDEO_ID>/):
     transcript.md   Kopf mit Metadaten + Kapitel + kompletter Text
@@ -15,7 +16,11 @@ Exit-Codes:
     0 OK | 1 unerwarteter Fehler | 2 ungueltige URL/ID | 3 Video-Metadaten nicht abrufbar
     4 keine Untertitel verfuegbar | 5 Untertitel-Download fehlgeschlagen (z. B. HTTP 429)
 
-Spurauswahl (siehe choose_track): Handgemachte Untertitel (manuell) werden vor
+Backends (--backend): "ytdlp" (Standard ohne Key) oder "supadata" (bezahlte Transkript-API,
+nur vorhandene Untertitel, mode=native). "auto" nimmt Supadata, wenn SUPADATA_API_KEY gesetzt
+ist, sonst yt-dlp. Der Key wird nur aus der Umgebung gelesen, nie ausgegeben.
+
+Spurauswahl (siehe choose_track, nur yt-dlp): Handgemachte Untertitel (manuell) werden vor
 automatischen bevorzugt. Reihenfolge:
     1. manuell de*      2. manuell en*
     3. auto de* (Original) 4. auto en* (Original)
@@ -33,11 +38,16 @@ import re
 import subprocess
 import sys
 import time
-from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
+from urllib.parse import parse_qs, urlencode, urlparse
 
 BACKOFF = (5, 15, 40)
 PARA_SECONDS = 30
 TOKENS_PER_WORD = 1.4
+SUPADATA_BASE = "https://api.supadata.ai/v1"
+SUPADATA_POLL_SECONDS = 3
+SUPADATA_POLL_MAX = 300
 
 
 # --------------------------------------------------------------------------- util
@@ -285,6 +295,138 @@ def fallback_api(video_id, langs):
         return None, None
 
 
+# --------------------------------------------------------------------- supadata
+class SupadataError(Exception):
+    """kind: auth | quota | none | other"""
+
+    def __init__(self, kind, msg):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def sd_http(path, params, key):
+    """GET gegen die Supadata-API -> (status, json). Wirft SupadataError bei Fehlern."""
+    url = f"{SUPADATA_BASE}{path}" + (f"?{urlencode(params)}" if params else "")
+    req = urllib.request.Request(url, headers={
+        "x-api-key": key, "Accept": "application/json", "User-Agent": "yt-transcript-skill/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            status, body = r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        raise SupadataError("other", f"Supadata nicht erreichbar: {str(e)[:160]}")
+    try:
+        data = json.loads(body) if body.strip() else {}
+    except ValueError:
+        data = {}
+    if status in (401, 403):
+        raise SupadataError("auth", "Supadata-API-Key ungueltig (SUPADATA_API_KEY pruefen).")
+    if status in (402, 429):
+        raise SupadataError("quota", "Supadata-Kontingent bzw. Rate-Limit erreicht.")
+    if status in (206, 404):
+        raise SupadataError("none", "Keine Untertitel fuer dieses Video verfuegbar.")
+    if status >= 400:
+        detail = (data.get("message") or data.get("error") or "") if isinstance(data, dict) else ""
+        raise SupadataError("other", f"Supadata-Fehler HTTP {status}: {str(detail)[:160]}")
+    return status, data
+
+
+def sd_content(data):
+    """Findet die Chunk-Liste, auch wenn sie unter 'result' verschachtelt ist."""
+    if not isinstance(data, dict):
+        return None, None, []
+    if isinstance(data.get("content"), list):
+        return data["content"], data.get("lang"), data.get("availableLangs") or []
+    if isinstance(data.get("result"), dict):
+        return sd_content(data["result"])
+    return None, None, []
+
+
+def sd_transcript_call(vid, lang, key):
+    """Ein Transkript-Aufruf (mode=native); pollt bei 202 den Job. -> (content, lang, available)."""
+    params = {"url": f"https://www.youtube.com/watch?v={vid}", "mode": "native"}
+    if lang:
+        params["lang"] = lang
+    status, data = sd_http("/transcript", params, key)
+    if status == 202 or (isinstance(data, dict) and data.get("jobId") and "content" not in data):
+        job = data.get("jobId")
+        waited = 0
+        while waited < SUPADATA_POLL_MAX:
+            time.sleep(SUPADATA_POLL_SECONDS)
+            waited += SUPADATA_POLL_SECONDS
+            _, data = sd_http(f"/transcript/{job}", None, key)
+            st = (data.get("status") or "").lower() if isinstance(data, dict) else ""
+            if st == "failed":
+                err = data.get("error")
+                msg = err.get("message") if isinstance(err, dict) else err
+                raise SupadataError("other", f"Supadata-Job fehlgeschlagen: {str(msg or '')[:160]}")
+            if st == "completed" or sd_content(data)[0] is not None:
+                break
+        else:
+            raise SupadataError("other", "Supadata-Job nicht rechtzeitig fertig (Timeout nach 5 Minuten).")
+    content, got, avail = sd_content(data)
+    if not content:
+        raise SupadataError("none", "Keine Untertitel fuer dieses Video verfuegbar.")
+    return content, got, avail
+
+
+def sd_segments(content):
+    """Supadata-Chunks (offset in ms) -> [(start_sekunden, text)]."""
+    out = []
+    for c in content:
+        t = re.sub(r"\s+", " ", str(c.get("text") or "")).strip()
+        if t:
+            out.append(((c.get("offset") or 0) / 1000.0, t))
+    return out
+
+
+def sd_transcript(vid, langs, key):
+    """Max. 2 Aufrufe: erst langs[0]; weicht die Sprache ab und ist langs[1:] verfuegbar, noch einmal."""
+    content, got, avail = sd_transcript_call(vid, langs[0], key)
+    if got and got.lower() != langs[0]:
+        avail_l = [x.lower() for x in avail]
+        nxt = next((l for l in langs[1:] if l != got.lower() and l in avail_l), None)
+        if nxt:
+            content, got, avail = sd_transcript_call(vid, nxt, key)
+    return sd_segments(content), (got or langs[0])
+
+
+_CH = re.compile(r"^\s*(?:[-*\u2022]\s*)?\(?((?:\d{1,2}:)?\d{1,2}:\d{2})\)?\s*[-\u2013\u2014:|]?\s*(.+?)\s*$")
+
+
+def parse_chapters(desc):
+    """Kapitel aus Beschreibungszeilen wie '0:00 Intro' (wie YouTube: erstes bei 0:00, >= 3)."""
+    found = []
+    for ln in (desc or "").splitlines():
+        m = _CH.match(ln)
+        if not m:
+            continue
+        parts = [int(x) for x in m.group(1).split(":")]
+        sec = parts[0] * 3600 + parts[1] * 60 + parts[2] if len(parts) == 3 else parts[0] * 60 + parts[1]
+        if found and sec <= found[-1]["start_time"]:
+            continue
+        found.append({"start_time": sec, "title": m.group(2)})
+    if len(found) < 3 or found[0]["start_time"] != 0:
+        return []
+    for c, n in zip(found, found[1:]):
+        c["end_time"] = n["start_time"]
+    return found
+
+
+def sd_info(vid, key):
+    """Metadaten ueber /youtube/video im yt-dlp-aehnlichen Dict-Format (1 Aufruf)."""
+    _, d = sd_http("/youtube/video", {"id": vid}, key)
+    d = d if isinstance(d, dict) else {}
+    ch = d.get("channel")
+    ud = (d.get("uploadDate") or "")[:10]
+    desc = d.get("description") or ""
+    return {"title": d.get("title"), "channel": ch.get("name") if isinstance(ch, dict) else ch,
+            "upload_date": ud.replace("-", ""), "duration": int(d.get("duration") or 0),
+            "description": desc, "chapters": parse_chapters(desc),
+            "transcript_languages": d.get("transcriptLanguages") or []}
+
+
 # --------------------------------------------------------------------- chunking
 def make_ranges(chapters, duration, chunk_min):
     """Liefert [(start, end, titel)] gemaess Kapiteln oder festen Fenstern."""
@@ -332,6 +474,8 @@ def main():
     ap.add_argument("--plain", action="store_true", help="Ohne Zeitstempel ausgeben")
     ap.add_argument("--cookies", help="cookies.txt (Netscape-Format) fuer Altersfreigabe/Bot-Pruefung")
     ap.add_argument("--list", action="store_true", help="Nur verfuegbare Untertitelspuren anzeigen")
+    ap.add_argument("--backend", choices=("auto", "ytdlp", "supadata"), default="auto",
+                    help="Quelle: auto (Supadata, wenn SUPADATA_API_KEY gesetzt, sonst yt-dlp), ytdlp, supadata")
     a = ap.parse_args()
 
     vid = parse_video_id(a.url)
@@ -339,52 +483,80 @@ def main():
         die(2, "Keine gueltige YouTube-URL oder Video-ID erkannt.")
     langs = [l.strip().lower() for l in a.lang.split(",") if l.strip()] or ["de", "en"]
 
-    ensure_yt_dlp()
-    try:
-        ydl, info = fetch_info(vid, a.cookies)
-    except Exception as e:  # noqa: BLE001
-        msg = str(e).replace("ERROR: ", "").splitlines()[0][:300]
-        hint = ""
-        low = msg.lower()
-        if "not a bot" in low:
-            hint = " (YouTube-Bot-Pruefung/IP-Drosselung: einige Minuten warten, evtl. --cookies cookies.txt angeben)"
-        elif "age" in low or "sign in" in low:
-            hint = " (Altersbeschraenkt/Anmeldung noetig: --cookies cookies.txt angeben oder Transkript manuell einfuegen)"
-        elif "429" in msg:
-            hint = " (Rate-Limit; spaeter erneut versuchen)"
-        elif "private" in low or "unavailable" in low:
-            hint = " (Video privat oder nicht verfuegbar)"
-        die(3, f"Metadaten fuer {vid} nicht abrufbar: {msg}{hint}")
+    key_env = os.environ.get("SUPADATA_API_KEY", "").strip()
+    backend = a.backend
+    if backend == "auto":
+        backend = "supadata" if key_env else "ytdlp"
+    if backend == "supadata" and not key_env:
+        die(3, "SUPADATA_API_KEY ist nicht gesetzt. Key als Umgebungsvariable (Netzwerk-Secret) "
+               "in den Umgebungseinstellungen hinterlegen - nie im Chat einfuegen.")
 
-    if a.list:
-        print(f"{info.get('title')}  [{vid}]  Sprache: {info.get('language')}")
-        list_tracks(info)
-        return
+    if backend == "supadata":
+        try:
+            info = sd_info(vid, key_env)
+        except SupadataError as e:
+            die(3, f"Metadaten fuer {vid} nicht abrufbar: {e}")
+        if a.list:
+            print(f"{info.get('title')}  [{vid}]  Backend: Supadata (native)")
+            print("Verfuegbare Untertitelsprachen:", ", ".join(info["transcript_languages"]) or "keine")
+            return
+        duration = info.get("duration") or 0
+        chapters = info.get("chapters") or []
+        try:
+            segs, key = sd_transcript(vid, langs, key_env)
+        except SupadataError as e:
+            die(4 if e.kind == "none" else 5, str(e))
+        source, is_auto, fmt = "Supadata (native)", False, "api"
+        info["language"] = key
+    else:
+        ensure_yt_dlp()
+        try:
+            ydl, info = fetch_info(vid, a.cookies)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).replace("ERROR: ", "").splitlines()[0][:300]
+            hint = ""
+            low = msg.lower()
+            if "not a bot" in low:
+                hint = (" (YouTube-Bot-Pruefung/IP-Drosselung: einige Minuten warten, evtl. --cookies cookies.txt angeben."
+                        " Alternative: SUPADATA_API_KEY in den Umgebungseinstellungen (Netzwerk-Secrets/Umgebungsvariable) "
+                        "setzen, dann nutzt --backend auto die Supadata-API)")
+            elif "age" in low or "sign in" in low:
+                hint = " (Altersbeschraenkt/Anmeldung noetig: --cookies cookies.txt angeben oder Transkript manuell einfuegen)"
+            elif "429" in msg:
+                hint = " (Rate-Limit; spaeter erneut versuchen)"
+            elif "private" in low or "unavailable" in low:
+                hint = " (Video privat oder nicht verfuegbar)"
+            die(3, f"Metadaten fuer {vid} nicht abrufbar: {msg}{hint}")
 
-    duration = info.get("duration") or 0
-    chapters = info.get("chapters") or []
-    track = choose_track(info, langs)
-    segs, source, key, is_auto, fmt = None, None, None, None, None
-    if track:
-        key, is_auto, entries = track
-        fmt, url = pick_entry(entries)
-        if url:
-            try:
-                raw = download(ydl, url)
-                segs = parse_json3(raw) if fmt == "json3" else parse_vtt(raw)
-                source = "yt-dlp"
-            except Exception as e:  # noqa: BLE001
-                print(f"Download der Spur '{key}' fehlgeschlagen: {str(e).splitlines()[0][:160]}", file=sys.stderr)
-    if not segs:
-        segs, source = fallback_api(vid, langs)
-        if segs:
-            key, is_auto, fmt = "api", True, "api"
-    if not segs:
+        if a.list:
+            print(f"{info.get('title')}  [{vid}]  Sprache: {info.get('language')}")
+            list_tracks(info)
+            return
+
+        duration = info.get("duration") or 0
+        chapters = info.get("chapters") or []
+        track = choose_track(info, langs)
+        segs, source, key, is_auto, fmt = None, None, None, None, None
         if track:
-            die(5, "Untertitel-Download fehlgeschlagen (vermutlich HTTP 429 / IP-Sperre). "
-                   "Spaeter erneut versuchen oder anderes Netz nutzen.")
-        die(4, "Keine Untertitel fuer dieses Video verfuegbar. "
-               "Bitte Transkript manuell einfuegen (YouTube: '...' > 'Transkript anzeigen').")
+            key, is_auto, entries = track
+            fmt, url = pick_entry(entries)
+            if url:
+                try:
+                    raw = download(ydl, url)
+                    segs = parse_json3(raw) if fmt == "json3" else parse_vtt(raw)
+                    source = "yt-dlp"
+                except Exception as e:  # noqa: BLE001
+                    print(f"Download der Spur '{key}' fehlgeschlagen: {str(e).splitlines()[0][:160]}", file=sys.stderr)
+        if not segs:
+            segs, source = fallback_api(vid, langs)
+            if segs:
+                key, is_auto, fmt = "api", True, "api"
+        if not segs:
+            if track:
+                die(5, "Untertitel-Download fehlgeschlagen (vermutlich HTTP 429 / IP-Sperre). "
+                       "Spaeter erneut versuchen oder anderes Netz nutzen.")
+            die(4, "Keine Untertitel fuer dieses Video verfuegbar. "
+                   "Bitte Transkript manuell einfuegen (YouTube: '...' > 'Transkript anzeigen').")
 
     clean = clean_segments(segs)
     paras = build_paragraphs(clean)
@@ -407,7 +579,7 @@ def main():
     desc = (info.get("description") or "").strip()
     desc = desc[:1500] + (" ..." if len(desc) > 1500 else "")
     link = f"https://youtu.be/{vid}"
-    kind = "automatisch" if is_auto else "manuell"
+    kind = "automatisch" if is_auto else ("nativ" if backend == "supadata" else "manuell")
 
     ranges = make_ranges(chapters, duration, a.chunk_minutes)
     chunks = []
@@ -442,7 +614,7 @@ def main():
         f.write("\n".join(lines) + "\n" + body + "\n")
 
     meta = {"id": vid, "title": title, "channel": channel, "upload_date": upload, "duration": duration,
-            "language": info.get("language"), "track": key, "track_kind": kind, "source": source,
+            "language": info.get("language"), "backend": backend, "track": key, "track_kind": kind, "source": source,
             "words": words_total, "est_tokens": est_tokens(words_total),
             "chapters": [{"start": c["start_time"], "title": c.get("title")} for c in chapters],
             "chunks": chunks}

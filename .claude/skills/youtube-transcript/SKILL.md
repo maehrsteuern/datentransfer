@@ -21,7 +21,8 @@ gruppiert sie in Absaetze mit Zeitstempel `[HH:MM:SS]` und teilt sie in Chunks
    Fehlt `yt-dlp`, installiert das Skript es selbst. Ausgabe landet in `./yt-transcripts/<ID>/`.
 
    Optionen: `--out DIR`, `--chunk-minutes 20`, `--plain` (ohne Zeitstempel),
-   `--list` (nur verfuegbare Spuren zeigen), `--cookies cookies.txt` (Altersfreigabe/Bot-Pruefung).
+   `--list` (nur verfuegbare Spuren zeigen), `--cookies cookies.txt` (Altersfreigabe/Bot-Pruefung),
+   `--backend auto|ytdlp|supadata` (siehe Backends).
 
 2. **Zusammenfassung lesen.** Das Skript druckt nur Metadaten, die gewaehlte Spur
    (manuell oder automatisch), Woerter, geschaetzte Tokens und eine Chunk-Tabelle
@@ -44,7 +45,18 @@ gruppiert sie in Absaetze mit Zeitstempel `[HH:MM:SS]` und teilt sie in Chunks
    Kennzeichnen, wenn die Spur **automatisch** erzeugt wurde: Eigennamen, Fachbegriffe
    und Zahlen koennen falsch transkribiert sein.
 
-## Spurauswahl
+## Backends
+
+- `--backend auto` (Standard): Ist `SUPADATA_API_KEY` gesetzt, wird die Supadata-API genutzt, sonst `yt-dlp`.
+  Scheitert `yt-dlp` an der Bot-Pruefung, weist das Skript auf den Key hin (Exit 3).
+- `supadata`: bezahlte Transkript-API, nur **vorhandene** Untertitel (`mode=native`, keine KI-Erzeugung).
+  Braucht kein `yt-dlp`. Kosten ca. 1 Kontingent-Einheit pro Aufruf (Transkript max. 2 Aufrufe, plus 1 Metadaten-Aufruf).
+  `--list` zeigt die verfuegbaren Sprachen (1 Aufruf).
+- Key nur als Umgebungsvariable `SUPADATA_API_KEY` setzen (Umgebungseinstellungen > Netzwerk-Secrets),
+  **nie im Chat einfuegen oder in Dateien schreiben**. Fehlt er, meldet das Skript das klar (Exit 3).
+- Kapitel werden bei Supadata aus Zeitstempel-Zeilen der Beschreibung abgeleitet (erstes bei 0:00, mind. 3).
+
+## Spurauswahl (yt-dlp)
 
 Handgemachte Untertitel vor automatischen; Reihenfolge gemaess `--lang` (Standard de, dann en),
 danach Originalsprache des Videos, danach irgendeine Spur. Maschinell uebersetzte
@@ -55,7 +67,7 @@ Auto-Spuren werden nur im Notfall genutzt. Letzter Fallback ist `youtube-transcr
 | Exit | Bedeutung / Abhilfe |
 |------|---------------------|
 | 2 | URL/ID nicht erkannt: Link pruefen (Playlist-Links brauchen `v=`). |
-| 3 | Metadaten nicht abrufbar: Video privat/geloescht/altersbeschraenkt oder Bot-Pruefung. Einige Minuten warten, ggf. `--cookies cookies.txt` (exportiert aus dem Browser). |
+| 3 | Metadaten nicht abrufbar (oder `SUPADATA_API_KEY` fehlt/ungueltig): Video privat/geloescht/altersbeschraenkt oder Bot-Pruefung. Einige Minuten warten, ggf. `--cookies cookies.txt` (exportiert aus dem Browser). |
 | 4 | Keine Untertitel vorhanden (z. B. Livestream, deaktiviert). Mit `--list` pruefen; sonst Nutzer bitten, das Transkript einzufuegen (YouTube: "..." > "Transkript anzeigen"). |
 | 5 | Download gescheitert, meist **HTTP 429**. Das Skript wiederholt automatisch nach 5/15/40 s. Danach 2-5 Minuten warten und erneut starten, nicht in Schleife wiederholen. |
 

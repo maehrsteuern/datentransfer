@@ -8,6 +8,7 @@ als Datei und teilt es in Chunks, die Claude abschnittsweise einlesen kann.
 - **Im Repo:** Der Ordner `.claude/skills/youtube-transcript/` wird automatisch erkannt.
 - **Global:** Ordner nach `~/.claude/skills/youtube-transcript/` kopieren.
 - Voraussetzung: Python 3. `yt-dlp` wird bei Bedarf automatisch per `pip` installiert.
+- Optional: Umgebungsvariable `SUPADATA_API_KEY` (siehe Abschnitt Backends).
 
 ## Installation in Claude.ai
 
@@ -21,4 +22,15 @@ als Datei und teilt es in Chunks, die Claude abschnittsweise einlesen kann.
 ```bash
 python3 scripts/yt_transcript.py "https://youtu.be/dQw4w9WgXcQ" --lang de,en --out ./yt-transcripts
 python3 scripts/yt_transcript.py dQw4w9WgXcQ --list
+```
+
+## Backends
+
+`--backend auto|ytdlp|supadata` (Standard `auto`). Mit gesetztem `SUPADATA_API_KEY` nutzt `auto`
+die bezahlte Supadata-API (nur vorhandene Untertitel, `mode=native`, ca. 1 Kontingent-Einheit pro
+Aufruf); sonst `yt-dlp`. Das hilft, wenn YouTube Cloud-IPs mit "Sign in to confirm you're not a bot"
+blockt. Der Key gehoert nur in die Umgebung (z. B. Netzwerk-Secrets), nie in den Chat oder ins Repo.
+
+```bash
+SUPADATA_API_KEY=... python3 scripts/yt_transcript.py dQw4w9WgXcQ --backend supadata --lang de,en
 ```
